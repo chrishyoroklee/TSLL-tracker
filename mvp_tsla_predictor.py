@@ -8,6 +8,7 @@ TSLA Next-Day Price Prediction MVP
 """
 
 import re
+from itertools import product
 
 import numpy as np
 import pandas as pd
@@ -75,49 +76,88 @@ y = df["target"]
 
 # -------- 3) Train model w/ TimeSeriesSplit --------
 tscv = TimeSeriesSplit(n_splits=5)
-model_params = {
+base_params = {
     "objective": "regression",
-    "n_estimators": 500,
-    "learning_rate": 0.05,
-    "num_leaves": 31,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8,
-    "min_child_samples": 20,
+    "n_estimators": 600,
     "random_state": 42,
     "verbosity": -1,
 }
 
-preds = []
-actuals = []
+grid_options = {
+    "learning_rate": [0.03, 0.05, 0.08],
+    "num_leaves": [31, 63],
+    "subsample": [0.75, 0.9],
+    "colsample_bytree": [0.7, 0.9],
+    "min_child_samples": [20],
+    "reg_lambda": [0.0, 0.5],
+}
 
-for train_idx, test_idx in tscv.split(X):
-    X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-    y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+grid_keys = list(grid_options.keys())
+param_grid = []
+max_combinations = 24
+for idx, combo in enumerate(product(*(grid_options[key] for key in grid_keys))):
+    candidate = dict(zip(grid_keys, combo))
+    param_grid.append(candidate)
+    if idx + 1 >= max_combinations:
+        break
 
-    fold_model = LGBMRegressor(**model_params)
-    fold_model.fit(X_train, y_train)
-    y_pred = fold_model.predict(X_test)
+if not param_grid:
+    raise ValueError("Parameter grid is empty; provide tuning options.")
 
-    preds.extend(y_pred)
-    actuals.extend(y_test.values)
+best_result = None
 
-# Final training on all data
-model = LGBMRegressor(**model_params)
+for params in param_grid:
+    candidate_params = {**base_params, **params}
+    fold_preds = []
+    fold_actuals = []
+
+    for train_idx, test_idx in tscv.split(X):
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+        fold_model = LGBMRegressor(**candidate_params)
+        fold_model.fit(X_train, y_train)
+        y_pred = fold_model.predict(X_test)
+
+        fold_preds.extend(y_pred)
+        fold_actuals.extend(y_test.values)
+
+    fold_preds = np.asarray(fold_preds)
+    fold_actuals = np.asarray(fold_actuals)
+    rmse = np.sqrt(mean_squared_error(fold_actuals, fold_preds))
+    mae = mean_absolute_error(fold_actuals, fold_preds)
+    direction_accuracy = np.mean(np.sign(fold_preds) == np.sign(fold_actuals))
+
+    result = {
+        "params": candidate_params,
+        "rmse": rmse,
+        "mae": mae,
+        "direction_accuracy": direction_accuracy,
+    }
+
+    if best_result is None or rmse < best_result["rmse"]:
+        best_result = result
+
+if best_result is None:
+    raise RuntimeError("Unable to fit any LightGBM model during tuning.")
+
+# Final training on all data with best params
+model = LGBMRegressor(**best_result["params"])
 model.fit(X, y)
 
 # -------- 4) Metrics --------
-# squared=False was added in newer sklearn; compute RMSE manually for compatibility.
-preds = np.asarray(preds)
-actuals = np.asarray(actuals)
-mse = mean_squared_error(actuals, preds)
-rmse = np.sqrt(mse)
-mae = mean_absolute_error(actuals, preds)
-direction_accuracy = np.mean(np.sign(preds) == np.sign(actuals))
+rmse = best_result["rmse"]
+mae = best_result["mae"]
+direction_accuracy = best_result["direction_accuracy"]
 
 print("---- Model Performance ----")
 print(f"RMSE: {rmse:.6f}")
 print(f"MAE:  {mae:.6f}")
 print(f"Direction Accuracy: {direction_accuracy:.3%}")
+
+print("\nBest Parameters:")
+for key in sorted(best_result["params"]):
+    print(f"{key}: {best_result['params'][key]}")
 
 # -------- 5) Predict tomorrow --------
 last_row = X.iloc[[-1]]
