@@ -1,172 +1,216 @@
 """
-TSLA Next-Day Price Prediction MVP
-----------------------------------
-- Downloads TSLA historical daily prices
-- Builds simple return, volatility, and microstructure features
-- Trains a LightGBM regressor w/ walk-forward validation
-- Predicts next-day return & price
+TSLA Multi-Horizon Forecast MVP (Hardened)
+------------------------------------------
+- Uses explicit auto_adjust=True (yfinance)
+- Aligns SPY/VIX to TSLA index
+- Builds features into a separate 'feat' frame
+- LightGBM point + quantile models for t+1 and t+5
 """
 
 import re
-from itertools import product
-
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 try:
     from lightgbm import LGBMRegressor
-except ImportError as exc:  # pragma: no cover - guidance for missing dependency
-    raise ImportError(
-        "LightGBM is required. Install it with `pip install lightgbm` inside your environment."
-    ) from exc
+except ImportError:
+    raise ImportError("Install with: pip install lightgbm")
 
+# ---------------- Config ----------------
+START_DATE = "2015-01-01"
+HORIZONS = {"t1": 1, "t5": 5}
+QUANTILES = [0.1, 0.5, 0.9]
+SPLITS = 5
+EMBARGO = 5
 
-# -------- 1) Download TSLA data --------
-df = yf.download("TSLA", start="2015-01-01", auto_adjust=False, progress=False)
-df = df[["Open", "High", "Low", "Close", "Volume"]]
-df.dropna(inplace=True)
-
-# -------- 2) Feature Engineering --------
-df["return"] = np.log(df["Close"] / df["Close"].shift(1))
-df["return_lag1"] = df["return"].shift(1)
-df["return_lag2"] = df["return"].shift(2)
-df["r3"] = df["return"].rolling(3).mean()
-df["r5"] = df["return"].rolling(5).mean()
-df["r10"] = df["return"].rolling(10).mean()
-df["r21"] = df["return"].rolling(21).mean()
-df["vol5"] = df["return"].rolling(5).std()
-df["vol10"] = df["return"].rolling(10).std()
-df["vol21"] = df["return"].rolling(21).std()
-df["volume_ratio"] = df["Volume"] / df["Volume"].rolling(10).mean()
-df["price_ma10_ratio"] = df["Close"] / df["Close"].rolling(10).mean()
-df["intraday_range"] = (df["High"] - df["Low"]) / df["Close"]
-df["target"] = df["return"].shift(-1)  # Next-day log return
-df.dropna(inplace=True)
-
-features = [
-    "return_lag1",
-    "return_lag2",
-    "r3",
-    "r5",
-    "r10",
-    "r21",
-    "vol5",
-    "vol10",
-    "vol21",
-    "volume_ratio",
-    "price_ma10_ratio",
-    "intraday_range",
-]
-
-
-def _sanitize(name: str) -> str:
-    """LightGBM disallows JSON meta characters; normalize to safe identifiers."""
-    sanitized = re.sub(r"[^0-9A-Za-z_]", "_", name)
-    return sanitized
-
-
-sanitized_feature_names = [_sanitize(name) for name in features]
-
-X = df[features].copy()
-X.columns = sanitized_feature_names
-y = df["target"]
-
-# -------- 3) Train model w/ TimeSeriesSplit --------
-tscv = TimeSeriesSplit(n_splits=5)
-base_params = {
+POINT_PARAMS = {
     "objective": "regression",
+    "learning_rate": 0.03,
+    "num_leaves": 31,
+    "subsample": 0.75,
+    "colsample_bytree": 0.9,
+    "min_child_samples": 20,
+    "reg_lambda": 0.5,
     "n_estimators": 600,
     "random_state": 42,
     "verbosity": -1,
 }
 
-grid_options = {
-    "learning_rate": [0.03, 0.05, 0.08],
-    "num_leaves": [31, 63],
-    "subsample": [0.75, 0.9],
-    "colsample_bytree": [0.7, 0.9],
-    "min_child_samples": [20],
-    "reg_lambda": [0.0, 0.5],
-}
+def sanitize(c): return re.sub(r"[^A-Za-z0-9_]", "_", c)
 
-grid_keys = list(grid_options.keys())
-param_grid = []
-max_combinations = 24
-for idx, combo in enumerate(product(*(grid_options[key] for key in grid_keys))):
-    candidate = dict(zip(grid_keys, combo))
-    param_grid.append(candidate)
-    if idx + 1 >= max_combinations:
-        break
+def earnings_flag(idx: pd.DatetimeIndex) -> pd.Series:
+    f = pd.Series(0, index=idx)
+    try:
+        er = yf.Ticker("TSLA").get_earnings_dates(limit=60)
+        if er is not None and not er.empty:
+            dates = er.index.tz_localize(None).normalize()
+            for d in dates:
+                for off in range(-3, 4):
+                    t = d + pd.Timedelta(days=off)
+                    if t in f.index:
+                        f.loc[t] = 1
+    except Exception:
+        pass
+    return f
 
-if not param_grid:
-    raise ValueError("Parameter grid is empty; provide tuning options.")
+# ---------------- Download ----------------
+tsla = yf.download(
+    "TSLA", start=START_DATE, auto_adjust=True, progress=False, group_by="column"
+)
+spy = yf.download(
+    "SPY", start=START_DATE, auto_adjust=True, progress=False, group_by="column"
+)
+vix = yf.download(
+    "^VIX", start=START_DATE, auto_adjust=True, progress=False, group_by="column"
+)
 
-best_result = None
+if tsla.empty:
+    raise RuntimeError("TSLA download returned empty data.")
 
-for params in param_grid:
-    candidate_params = {**base_params, **params}
-    fold_preds = []
-    fold_actuals = []
+# Keep only needed cols; align indexes to TSLA
+tsla = tsla[["Open","High","Low","Close","Volume"]].copy()
 
-    for train_idx, test_idx in tscv.split(X):
-        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+spy = spy[["Close"]].rename(columns={"Close":"SPY"})
+spy = spy.reindex(tsla.index).ffill().bfill()
 
-        fold_model = LGBMRegressor(**candidate_params)
-        fold_model.fit(X_train, y_train)
-        y_pred = fold_model.predict(X_test)
+vix = vix[["Close"]].rename(columns={"Close":"VIX"})
+vix = vix.reindex(tsla.index).ffill().bfill()
 
-        fold_preds.extend(y_pred)
-        fold_actuals.extend(y_test.values)
+# Combine base frame
+base = tsla.join(spy, how="left").join(vix, how="left")
+base = base.ffill().bfill()
+assert not base[["Close","SPY","VIX"]].isna().any().any(), "Base NA after align."
 
-    fold_preds = np.asarray(fold_preds)
-    fold_actuals = np.asarray(fold_actuals)
-    rmse = np.sqrt(mean_squared_error(fold_actuals, fold_preds))
-    mae = mean_absolute_error(fold_actuals, fold_preds)
-    direction_accuracy = np.mean(np.sign(fold_preds) == np.sign(fold_actuals))
+# ---------------- Features ----------------
+feat = pd.DataFrame(index=base.index)
 
-    result = {
-        "params": candidate_params,
-        "rmse": rmse,
-        "mae": mae,
-        "direction_accuracy": direction_accuracy,
-    }
+# price returns / trend / vol
+# Ensure Close is a 1D Series (yfinance can sometimes yield (n,1) frames)
+_close = base["Close"]
+if isinstance(_close, pd.DataFrame):
+    _close = _close.iloc[:, 0]
+ret = np.log(_close / _close.shift(1))
+feat["ret_l1"] = ret.shift(1)
+feat["ret_l2"] = ret.shift(2)
+feat["r3"]     = ret.rolling(3).mean()
+feat["r5"]     = ret.rolling(5).mean()
+feat["r10"]    = ret.rolling(10).mean()
+feat["r21"]    = ret.rolling(21).mean()
+feat["vol5"]   = ret.rolling(5).std()
+feat["vol10"]  = ret.rolling(10).std()
+feat["vol21"]  = ret.rolling(21).std()
 
-    if best_result is None or rmse < best_result["rmse"]:
-        best_result = result
+# microstructure-ish
+feat["vol_ratio"]  = base["Volume"] / base["Volume"].rolling(10).mean()
+feat["ma10_ratio"] = base["Close"] / base["Close"].rolling(10).mean()
+feat["range"]      = (base["High"] - base["Low"]) / base["Close"]
 
-if best_result is None:
-    raise RuntimeError("Unable to fit any LightGBM model during tuning.")
+# market context
+spy_ret = np.log(base["SPY"] / base["SPY"].shift(1))
+feat["spy_ret"]   = spy_ret
+feat["spy_r5"]    = spy_ret.rolling(5).mean()
+feat["spy_r21"]   = spy_ret.rolling(21).mean()
+feat["spy_vol10"] = spy_ret.rolling(10).std()
 
-# Final training on all data with best params
-model = LGBMRegressor(**best_result["params"])
-model.fit(X, y)
+feat["vix"]       = base["VIX"]
+feat["vix_chg"]   = base["VIX"].pct_change()
+feat["vix_vol10"] = feat["vix_chg"].rolling(10).std()
 
-# -------- 4) Metrics --------
-rmse = best_result["rmse"]
-mae = best_result["mae"]
-direction_accuracy = best_result["direction_accuracy"]
+# calendar
+feat["dow_sin"]   = np.sin(2*np.pi*feat.index.dayofweek/7)
+feat["dow_cos"]   = np.cos(2*np.pi*feat.index.dayofweek/7)
+feat["month_sin"] = np.sin(2*np.pi*(feat.index.month-1)/12)
+feat["month_cos"] = np.cos(2*np.pi*(feat.index.month-1)/12)
+feat["m_end"]     = feat.index.is_month_end.astype(int)
+feat["er_flag"]   = earnings_flag(feat.index)
 
-print("---- Model Performance ----")
-print(f"RMSE: {rmse:.6f}")
-print(f"MAE:  {mae:.6f}")
-print(f"Direction Accuracy: {direction_accuracy:.3%}")
+# targets on base (use flattened close series)
+t1 = ret.shift(-1)
+t5 = np.log(_close.shift(-5) / _close)
 
-print("\nBest Parameters:")
-for key in sorted(best_result["params"]):
-    print(f"{key}: {best_result['params'][key]}")
+targets = pd.DataFrame({"t1": t1, "t5": t5}, index=feat.index)
 
-# -------- 5) Predict tomorrow --------
-last_row = X.iloc[[-1]]
-pred_return = model.predict(last_row)[0]
+# ---------------- Clean / Assemble ----------------
+feature_cols = list(feat.columns)
+target_cols  = list(targets.columns)
 
-last_price = df["Close"].iloc[-1].item()
-predicted_price = float(last_price * np.exp(pred_return))
+# Sanity assert: all columns exist before filtering
+missing_now = [c for c in feature_cols if c not in feat.columns] + \
+              [c for c in target_cols if c not in targets.columns]
+assert not missing_now, f"Missing columns before dropna: {missing_now}"
 
-print("\n---- Prediction ----")
-print(f"Last Close Price: {last_price:.2f}")
-print(f"Predicted Return: {pred_return:.6f}")
-print(f"Predicted Next Close: {predicted_price:.2f}")
+# Drop NA rows across features + targets
+full = feat.join(targets, how="inner")
+full = full.dropna(subset=feature_cols + target_cols)
+
+if full.empty:
+    # Print helpful debug
+    print("DEBUG shapes:",
+          "\nfeat:", feat.shape, "feat NA rows:", feat.isna().all(axis=1).sum(),
+          "\ntargets:", targets.shape, "targets NA rows:", targets.isna().all(axis=1).sum())
+    print("Head(feat):\n", feat.head())
+    print("Head(targets):\n", targets.head())
+    raise RuntimeError("No rows left after dropna — likely due to too-short start window.")
+
+X = full[feature_cols].copy()
+X.columns = [sanitize(c) for c in X.columns]
+y = {"t1": full["t1"], "t5": full["t5"]}
+
+latest_feat = X.iloc[[-1]].copy()
+last_close = float(_close.loc[X.index[-1]])
+
+# ---------------- Eval ----------------
+tscv = TimeSeriesSplit(n_splits=SPLITS)
+
+def eval_target(yv):
+    preds, actual, qpreds = [], [], {q: [] for q in QUANTILES}
+    for tr, te in tscv.split(X):
+        tr = tr[:-EMBARGO] if len(tr) > EMBARGO else tr
+        Xtr, Xte = X.iloc[tr], X.iloc[te]
+        ytr, yte = yv.iloc[tr], yv.iloc[te]
+
+        m = LGBMRegressor(**POINT_PARAMS).fit(Xtr, ytr)
+        preds.extend(m.predict(Xte)); actual.extend(yte.values)
+
+        for q in QUANTILES:
+            qm = LGBMRegressor(**{**POINT_PARAMS, "objective":"quantile", "alpha": q})
+            qm.fit(Xtr, ytr)
+            qpreds[q].extend(qm.predict(Xte))
+
+    preds, actual = np.array(preds), np.array(actual)
+    rmse = np.sqrt(mean_squared_error(actual, preds))
+    mae  = mean_absolute_error(actual, preds)
+    da   = (np.sign(preds) == np.sign(actual)).mean()
+    lo, hi = np.array(qpreds[0.1]), np.array(qpreds[0.9])
+    cov = ((actual >= lo) & (actual <= hi)).mean()
+    iw  = (hi - lo).mean()
+    return rmse, mae, da, cov, iw
+
+print("\n=== PERFORMANCE ===")
+for k in ["t1","t5"]:
+    rmse, mae, da, cov, iw = eval_target(y[k])
+    print(f"\nHorizon {k}:")
+    print(f"RMSE {rmse:.6f}  MAE {mae:.6f}  Dir {da:.2%}  Cov {cov:.2%}  Width {iw:.6f}")
+
+# ---------------- Train final models ----------------
+pm, qm = {}, {}
+for k in ["t1","t5"]:
+    pm[k] = LGBMRegressor(**POINT_PARAMS).fit(X, y[k])
+    qm[k] = {q: LGBMRegressor(**{**POINT_PARAMS,"objective":"quantile","alpha":q}).fit(X, y[k])
+             for q in QUANTILES}
+
+# ---------------- Forecast ----------------
+print("\n=== FORECAST ===")
+print(f"Last Close: {last_close:.2f}")
+
+for k in ["t1","t5"]:
+    r = pm[k].predict(latest_feat)[0]
+    price = last_close * np.exp(r)
+    qvals = {q: qm[k][q].predict(latest_feat)[0] for q in QUANTILES}
+    qpx = {q: last_close * np.exp(qvals[q]) for q in qvals}
+    print(f"\n{k}: return {r:.6f}  →  price {price:.2f}")
+    print("q returns:", {q: round(qvals[q], 6) for q in qvals})
+    print("q prices:",  {q: round(qpx[q], 2)  for q in qpx})
