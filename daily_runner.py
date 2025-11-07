@@ -79,14 +79,24 @@ def main():
     ap.add_argument("--retrain", choices=["never", "weekly", "always"], default="never", help="Retraining policy")
     ap.add_argument("--window-years", type=int, default=3, help="Training window in years (0=all)")
     ap.add_argument("--cv", action="store_true", help="Print cross-validation metrics before training")
+    ap.add_argument(
+        "--end-policy",
+        choices=["prev_bday", "today_plus_1"],
+        default="prev_bday",
+        help="When --end not provided: use previous business day (default) or today+1d."
+    )
     args = ap.parse_args()
 
-    # End date defaults to tomorrow to ensure current day completes
-    end = None
+    # End date handling:
+    # - If --end provided, use it.
+    # - Otherwise, choose by policy: prev_bday (pipeline default) or today_plus_1.
     if args.end:
         end = pd.Timestamp(args.end)
     else:
-        end = pd.Timestamp.today().normalize() + pd.Timedelta(days=1)
+        if args.end_policy == "today_plus_1":
+            end = pd.Timestamp.today().normalize() + pd.Timedelta(days=1)
+        else:
+            end = None  # let get_latest_data pick previous business day
 
     # 1) Data
     base = get_latest_data(start=args.start, end=end)
@@ -123,7 +133,8 @@ def main():
         pm, qm = loaded
 
     # 4) Inference
-    latest_feat = latest_feature_row(X)
+    # Use the dedicated latest feature row (not truncated by t+5 target availability)
+    latest_feat = fs.latest_feat
     preds = {
         **{
             k: {
@@ -156,4 +167,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

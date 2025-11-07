@@ -74,10 +74,11 @@ def _earnings_flag(idx: pd.DatetimeIndex) -> pd.Series:
 
 @dataclass
 class FeatureSet:
-    X: pd.DataFrame
+    X: pd.DataFrame  # training features (rows with all targets available)
     y: Dict[str, pd.Series]
     last_close: float
-    as_of_date: pd.Timestamp
+    as_of_date: pd.Timestamp  # latest available trading day in the data
+    latest_feat: pd.DataFrame  # single-row features for inference at as_of_date
 
 
 def get_latest_data(
@@ -89,9 +90,45 @@ def get_latest_data(
     Columns: Open, High, Low, Close, Volume, SPY, VIX
     Index: trading days (TSLA calendar)
     """
-    tsla = yf.download("TSLA", start=start, end=end, auto_adjust=True, progress=False, group_by="column")
-    spy = yf.download("SPY", start=start, end=end, auto_adjust=True, progress=False, group_by="column")
-    vix = yf.download("^VIX", start=start, end=end, auto_adjust=True, progress=False, group_by="column")
+    # If end not provided, include up to previous business day to avoid same-day lag.
+    if end is None:
+        from pandas.tseries.offsets import BDay
+        target = pd.Timestamp.today().normalize() - BDay(1)
+        end = pd.Timestamp(target) + pd.Timedelta(days=1)
+
+    tsla = yf.download(
+        "TSLA",
+        start=start,
+        end=end,
+        interval="1d",
+        auto_adjust=True,
+        actions=False,
+        repair=True,
+        progress=False,
+        group_by="column",
+    )
+    spy = yf.download(
+        "SPY",
+        start=start,
+        end=end,
+        interval="1d",
+        auto_adjust=True,
+        actions=False,
+        repair=True,
+        progress=False,
+        group_by="column",
+    )
+    vix = yf.download(
+        "^VIX",
+        start=start,
+        end=end,
+        interval="1d",
+        auto_adjust=True,
+        actions=False,
+        repair=True,
+        progress=False,
+        group_by="column",
+    )
 
     if tsla is None or tsla.empty:
         raise RuntimeError("TSLA download returned empty data.")
@@ -169,6 +206,7 @@ def build_features(base: pd.DataFrame) -> FeatureSet:
     feature_cols = list(feat.columns)
     target_cols = list(targets.columns)
 
+    # Training set requires targets; drop rows without t1/t5
     full = feat.join(targets, how="inner").dropna(subset=feature_cols + target_cols)
     if full.empty:
         raise RuntimeError("No rows left after dropna — likely due to too-short start window.")
@@ -177,9 +215,13 @@ def build_features(base: pd.DataFrame) -> FeatureSet:
     X.columns = [sanitize(c) for c in X.columns]
     y = {"t1": full["t1"], "t5": full["t5"]}
 
-    as_of_date = X.index[-1]
+    # For inference, use the latest feature row regardless of target availability
+    feat_all = feat.copy()
+    feat_all.columns = [sanitize(c) for c in feat_all.columns]
+    latest_feat = feat_all.iloc[[-1]].copy()
+    as_of_date = feat_all.index[-1]
     last_close = float(_close.loc[as_of_date])
-    return FeatureSet(X=X, y=y, last_close=last_close, as_of_date=as_of_date)
+    return FeatureSet(X=X, y=y, last_close=last_close, as_of_date=as_of_date, latest_feat=latest_feat)
 
 
 def evaluate_cv(
@@ -249,6 +291,7 @@ def load_models(models_dir: str = "models") -> Optional[Tuple[Dict[str, LGBMRegr
 
 
 def latest_feature_row(X: pd.DataFrame) -> pd.DataFrame:
+    # Deprecated in favor of FeatureSet.latest_feat but kept for backward compatibility
     return X.iloc[[-1]].copy()
 
 
@@ -280,5 +323,3 @@ def restrict_training_window(X: pd.DataFrame, y: Dict[str, pd.Series], years: Op
     Xw = X.loc[X.index >= cutoff]
     yw = {k: y[k].loc[Xw.index] for k in y}
     return Xw, yw
-
-

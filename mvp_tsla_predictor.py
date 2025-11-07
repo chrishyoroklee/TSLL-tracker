@@ -11,6 +11,7 @@ import re
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from pandas.tseries.offsets import BDay
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
@@ -57,14 +58,22 @@ def earnings_flag(idx: pd.DatetimeIndex) -> pd.Series:
     return f
 
 # ---------------- Download ----------------
+# Ensure we include up to the previous business day to avoid same-day lag.
+_today = pd.Timestamp.today().normalize()
+_target = _today - BDay(1)
+_end = pd.Timestamp(_target) + pd.Timedelta(days=1)
+
 tsla = yf.download(
-    "TSLA", start=START_DATE, auto_adjust=True, progress=False, group_by="column"
+    "TSLA", start=START_DATE, end=_end, interval="1d", auto_adjust=True,
+    actions=False, repair=True, progress=False, group_by="column"
 )
 spy = yf.download(
-    "SPY", start=START_DATE, auto_adjust=True, progress=False, group_by="column"
+    "SPY", start=START_DATE, end=_end, interval="1d", auto_adjust=True,
+    actions=False, repair=True, progress=False, group_by="column"
 )
 vix = yf.download(
-    "^VIX", start=START_DATE, auto_adjust=True, progress=False, group_by="column"
+    "^VIX", start=START_DATE, end=_end, interval="1d", auto_adjust=True,
+    actions=False, repair=True, progress=False, group_by="column"
 )
 
 if tsla.empty:
@@ -159,8 +168,11 @@ X = full[feature_cols].copy()
 X.columns = [sanitize(c) for c in X.columns]
 y = {"t1": full["t1"], "t5": full["t5"]}
 
-latest_feat = X.iloc[[-1]].copy()
-last_close = float(_close.loc[X.index[-1]])
+# For inference, use the final feature row even if t5 target is NaN
+feat_sanitized = feat.copy()
+feat_sanitized.columns = [sanitize(c) for c in feat_sanitized.columns]
+latest_feat = feat_sanitized.iloc[[-1]].copy()
+last_close = float(_close.loc[feat_sanitized.index[-1]])
 
 # ---------------- Eval ----------------
 tscv = TimeSeriesSplit(n_splits=SPLITS)
